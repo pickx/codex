@@ -76,6 +76,8 @@ impl LocalSettings {
                 status_line_use_colors: config.tui_status_line_use_colors,
                 terminal_title: config.tui_terminal_title.clone(),
                 theme: config.tui_theme.clone(),
+                theme_light: config.tui_theme_light.clone(),
+                theme_dark: config.tui_theme_dark.clone(),
                 pet: config.tui_pet.clone(),
                 pet_anchor: config.tui_pet_anchor,
                 session_picker_view: Some(config.tui_session_picker_view),

@@ -1161,6 +1161,7 @@ impl App {
     pub(super) fn sync_tui_theme_selection(&mut self, name: String) {
         self.local_settings.tui.theme = Some(name.clone());
         self.chat_widget.set_tui_theme(Some(name));
+        self.restore_runtime_theme_from_config();
     }
 
     #[cfg(test)]
@@ -1176,23 +1177,10 @@ impl App {
     }
 
     pub(super) fn restore_runtime_theme_from_config(&self) {
-        if let Some(name) = self.local_settings.tui.theme.as_deref()
-            && let Some(theme) = crate::render::highlight::resolve_theme_by_name(
-                name,
-                Some(&self.local_settings.codex_home),
-            )
-        {
-            crate::render::highlight::set_syntax_theme(theme);
-            return;
-        }
-
-        let auto_theme_name = crate::render::highlight::adaptive_default_theme_name();
-        if let Some(theme) = crate::render::highlight::resolve_theme_by_name(
-            auto_theme_name,
-            Some(&self.local_settings.codex_home),
-        ) {
-            crate::render::highlight::set_syntax_theme(theme);
-        }
+        crate::render::highlight::set_theme_preferences(
+            &self.local_settings.tui,
+            self.local_settings.codex_home.as_path(),
+        );
     }
 
     fn sync_feature_state_from_effective_config(

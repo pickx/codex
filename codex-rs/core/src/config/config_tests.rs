@@ -1277,6 +1277,8 @@ fn config_toml_deserializes_model_availability_nux() {
             status_line_use_colors: true,
             terminal_title: None,
             theme: None,
+            theme_light: None,
+            theme_dark: None,
             pet: None,
             pet_anchor: TuiPetAnchor::Composer,
             session_picker_view: None,
@@ -4309,11 +4311,21 @@ fn tui_theme_deserializes_from_toml() {
     let cfg = r#"
 [tui]
 theme = "dracula"
+theme_light = "github"
+theme_dark = "monokai"
 "#;
     let parsed = toml::from_str::<ConfigToml>(cfg).expect("TOML deserialization should succeed");
     assert_eq!(
         parsed.tui.as_ref().and_then(|t| t.theme.as_deref()),
         Some("dracula"),
+    );
+    assert_eq!(
+        parsed.tui.as_ref().and_then(|t| t.theme_light.as_deref()),
+        Some("github")
+    );
+    assert_eq!(
+        parsed.tui.as_ref().and_then(|t| t.theme_dark.as_deref()),
+        Some("monokai")
     );
 }
 
@@ -4419,6 +4431,8 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             status_line_use_colors: true,
             terminal_title: None,
             theme: None,
+            theme_light: None,
+            theme_dark: None,
             pet: None,
             pet_anchor: TuiPetAnchor::Composer,
             session_picker_view: None,

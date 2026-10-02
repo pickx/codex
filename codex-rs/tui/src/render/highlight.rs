@@ -69,10 +69,88 @@ static THEME_REVISION: AtomicU64 = AtomicU64::new(0);
 static THEME_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 static CODEX_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+#[derive(Clone, Default)]
+struct ThemePreferences {
+    fixed: Option<String>,
+    light: Option<String>,
+    dark: Option<String>,
+    home: Option<PathBuf>,
+}
+
+impl ThemePreferences {
+    fn resolve(&self, light: bool) -> (String, Theme) {
+        let adaptive = if light {
+            self.light.as_deref()
+        } else {
+            self.dark.as_deref()
+        };
+        for name in [self.fixed.as_deref(), adaptive].into_iter().flatten() {
+            if let Some(theme) = resolve_theme_by_name(name, self.home.as_deref()) {
+                return (name.to_string(), theme);
+            }
+        }
+        let (name, embedded) = if light {
+            ("catppuccin-latte", EmbeddedThemeName::CatppuccinLatte)
+        } else {
+            ("catppuccin-mocha", EmbeddedThemeName::CatppuccinMocha)
+        };
+        (
+            name.to_string(),
+            two_face::theme::extra().get(embedded).clone(),
+        )
+    }
+}
+
+#[cfg(not(test))]
+static THEME_PREFERENCES: OnceLock<RwLock<Option<ThemePreferences>>> = OnceLock::new();
+
+fn theme_preferences() -> Option<ThemePreferences> {
+    #[cfg(not(test))]
+    {
+        THEME_PREFERENCES
+            .get_or_init(|| RwLock::new(None))
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(test)]
+    TEST_THEME_PREFERENCES.with(|preferences| preferences.borrow().clone())
+}
+
+pub(crate) fn set_theme_preferences(tui: &codex_config::types::Tui, home: &Path) -> Vec<String> {
+    let preferences = ThemePreferences {
+        fixed: tui.theme.clone(),
+        light: tui.theme_light.clone(),
+        dark: tui.theme_dark.clone(),
+        home: Some(home.to_path_buf()),
+    };
+    let warnings = [
+        ("theme_light", preferences.light.as_deref()),
+        ("theme_dark", preferences.dark.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(field, name)| {
+        validate_theme_name(name, Some(home)).map(|warning| format!("tui.{field}: {warning}"))
+    })
+    .collect();
+    #[cfg(not(test))]
+    {
+        *THEME_PREFERENCES
+            .get_or_init(|| RwLock::new(None))
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(preferences);
+    }
+    #[cfg(test)]
+    TEST_THEME_PREFERENCES.with(|value| *value.borrow_mut() = Some(preferences));
+    set_syntax_theme(build_default_theme());
+    warnings
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_THEME: std::cell::OnceCell<std::sync::Arc<RwLock<Theme>>> = const { std::cell::OnceCell::new() };
     static TEST_THEME_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_THEME_PREFERENCES: std::cell::RefCell<Option<ThemePreferences>> = const { std::cell::RefCell::new(None) };
 }
 
 // Syntect/bat encode ANSI palette semantics in alpha:
@@ -244,6 +322,11 @@ fn resolve_theme_with_override(name: Option<&str>, codex_home: Option<&Path>) ->
 /// Build the theme from current override/default-theme settings.
 /// Extracted from the old `theme()` init closure so it can be reused.
 fn build_default_theme() -> Theme {
+    if let Some(preferences) = theme_preferences() {
+        return preferences
+            .resolve(crate::terminal_palette::default_bg().is_some_and(crate::color::is_light))
+            .1;
+    }
     let name = THEME_OVERRIDE.get().and_then(|name| name.as_deref());
     let codex_home = CODEX_HOME
         .get()
@@ -391,6 +474,11 @@ pub(crate) fn foreground_style_for_scopes_with_theme(
 /// This intentionally reflects persisted configuration/default selection, not
 /// transient runtime swaps applied via `set_syntax_theme`.
 pub(crate) fn configured_theme_name() -> String {
+    if let Some(preferences) = theme_preferences() {
+        return preferences
+            .resolve(crate::terminal_palette::default_bg().is_some_and(crate::color::is_light))
+            .0;
+    }
     // Explicit user override?
     if let Some(Some(name)) = THEME_OVERRIDE.get() {
         let home = CODEX_HOME.get().and_then(|home| home.as_deref());
@@ -790,6 +878,74 @@ mod tests {
     use super::*;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn adaptive_theme_preferences_follow_palette_and_honor_fixed_selection() {
+        let home = std::env::temp_dir();
+        let light = crate::terminal_probe::DefaultColors {
+            fg: (0, 0, 0),
+            bg: (255, 255, 255),
+        };
+        let dark = crate::terminal_probe::DefaultColors {
+            fg: (255, 255, 255),
+            bg: (0, 0, 0),
+        };
+        crate::terminal_palette::set_default_colors_from_startup_probe(Some(light));
+        let mut preferences = codex_config::types::Tui {
+            theme_light: Some("github".into()),
+            theme_dark: Some("dracula".into()),
+            ..Default::default()
+        };
+        assert!(set_theme_preferences(&preferences, &home).is_empty());
+        for (colors, expected) in [(dark, "dracula"), (light, "github")] {
+            refresh_terminal_palette(colors);
+            assert_eq!(configured_theme_name(), expected);
+            assert_eq!(
+                current_syntax_theme(),
+                resolve_theme_by_name(expected, None).unwrap()
+            );
+        }
+        preferences.theme = Some("gruvbox-dark".into());
+        assert!(set_theme_preferences(&preferences, &home).is_empty());
+        for colors in [dark, light] {
+            refresh_terminal_palette(colors);
+            assert_eq!(configured_theme_name(), "gruvbox-dark");
+            assert_eq!(
+                current_syntax_theme(),
+                resolve_theme_by_name("gruvbox-dark", None).unwrap()
+            );
+        }
+        let preview = resolve_theme_by_name("dracula", None).unwrap();
+        set_syntax_theme(preview.clone());
+        let revision = syntax_theme_revision();
+        refresh_terminal_palette(dark);
+        assert_eq!(current_syntax_theme(), preview);
+        assert!(syntax_theme_revision() > revision);
+    }
+
+    #[test]
+    fn adaptive_theme_preferences_fall_back_for_missing_or_invalid_names() {
+        let home = std::env::temp_dir();
+        let preferences = codex_config::types::Tui {
+            theme_light: Some("missing-light-theme".into()),
+            theme_dark: Some("missing-dark-theme".into()),
+            ..Default::default()
+        };
+        let warnings = set_theme_preferences(&preferences, &home);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("tui.theme_light"));
+        assert!(warnings[1].contains("tui.theme_dark"));
+        let configured = theme_preferences().unwrap();
+        for light in [false, true] {
+            let expected = if light {
+                "catppuccin-latte"
+            } else {
+                "catppuccin-mocha"
+            };
+            assert_eq!(configured.resolve(light).0, expected);
+            assert_eq!(ThemePreferences::default().resolve(light).0, expected);
+        }
+    }
     use std::str::FromStr;
     use syntect::highlighting::Color as SyntectColor;
     use syntect::highlighting::ScopeSelectors;

@@ -915,6 +915,10 @@ pub struct Tui {
     /// Use `/theme` in the TUI or see `$CODEX_HOME/themes` for custom themes.
     #[serde(default)]
     pub theme: Option<String>,
+    #[serde(default)]
+    pub theme_light: Option<String>,
+    #[serde(default)]
+    pub theme_dark: Option<String>,
 
     /// Pet id to preselect in the terminal pet picker.
     ///

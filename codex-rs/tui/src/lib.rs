@@ -1433,12 +1433,11 @@ async fn run_ratatui_app(
     crate::markdown_render::preferences::init(config.tui_rendering);
     // Startup pickers need the current theme before selection can reload config.
     // Leave the one-time override initialization below to use the final config.
-    if (cli.resume_picker || cli.fork_picker)
-        && let Some(name) = config.tui_theme.as_deref()
-        && let Some(theme) =
-            crate::render::highlight::resolve_theme_by_name(name, Some(config.codex_home.as_path()))
-    {
-        crate::render::highlight::set_syntax_theme(theme);
+    if cli.resume_picker || cli.fork_picker {
+        crate::render::highlight::set_theme_preferences(
+            &crate::local_settings::LocalSettings::from(&config).tui,
+            config.codex_home.as_path(),
+        );
     }
 
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
@@ -1962,6 +1961,13 @@ async fn run_ratatui_app(
     ) {
         config.startup_warnings.push(w);
     }
+
+    config
+        .startup_warnings
+        .extend(crate::render::highlight::set_theme_preferences(
+            &local_settings.tui,
+            local_settings.codex_home.as_path(),
+        ));
 
     set_default_client_residency_requirement(config.enforce_residency.value());
     let is_first_run = config.active_project.trust_level.is_none();
