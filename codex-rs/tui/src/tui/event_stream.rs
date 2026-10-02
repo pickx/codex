@@ -266,6 +266,10 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
     /// Map a crossterm event to a [`TuiEvent`], preserving mouse coordinates and modifiers.
     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
         match event {
+            Event::ColorSchemeChanged(scheme) => {
+                tracing::debug!(?scheme, "terminal color scheme changed");
+                Some(TuiEvent::Draw)
+            }
             Event::Key(key_event) => {
                 #[cfg(unix)]
                 if crate::tui::job_control::SUSPEND_KEY.is_press(key_event) {
@@ -339,6 +343,7 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::ColorScheme;
     use crossterm::event::Event;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
@@ -456,6 +461,29 @@ mod tests {
         match stream.next().await {
             Some(TuiEvent::Key(actual)) => assert_eq!(actual, expected),
             other => panic!("expected key event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn color_scheme_reports_request_draws_and_preserve_queued_keys() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        terminal_focused.store(false, Ordering::Relaxed);
+        let mut stream = make_stream(broker, draw_rx, terminal_focused.clone());
+        let expected_key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        for scheme in [ColorScheme::Dark, ColorScheme::Dark, ColorScheme::Light] {
+            handle.send(Ok(Event::ColorSchemeChanged(scheme)));
+            handle.send(Ok(Event::Key(expected_key)));
+
+            assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+            assert!(!terminal_focused.load(Ordering::Relaxed));
+            let next = timeout(Duration::from_millis(100), stream.next())
+                .await
+                .expect("color scheme handling discarded an already queued key");
+            match next {
+                Some(TuiEvent::Key(key)) => assert_eq!(key, expected_key),
+                other => panic!("expected queued key event, got {other:?}"),
+            }
         }
     }
 

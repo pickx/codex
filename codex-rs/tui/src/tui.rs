@@ -18,12 +18,18 @@ use crossterm::Command;
 use crossterm::SynchronizedUpdate;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
+#[cfg(unix)]
+use crossterm::event::DisableColorSchemeChange;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
+#[cfg(unix)]
+use crossterm::event::EnableColorSchemeChange;
 #[cfg(not(windows))]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyEvent;
 use crossterm::event::MouseEvent;
+#[cfg(unix)]
+use crossterm::event::RequestColorScheme;
 #[cfg(not(unix))]
 use crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::backend::Backend;
@@ -259,6 +265,8 @@ pub fn set_modes() -> Result<()> {
     let _ = execute!(stdout(), EnableFocusChange);
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(unix)]
+    let _ = execute!(stdout(), EnableColorSchemeChange, RequestColorScheme);
     Ok(())
 }
 
@@ -347,6 +355,8 @@ fn restore_common(
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(unix)]
+    let _ = execute!(stdout(), DisableColorSchemeChange);
     if matches!(raw_mode_restore, RawModeRestore::Disable)
         && let Err(err) = disable_raw_mode()
     {

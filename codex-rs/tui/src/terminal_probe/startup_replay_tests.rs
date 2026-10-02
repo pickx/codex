@@ -3,6 +3,13 @@ use super::startup_replay_input;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn startup_replay_preserves_color_scheme_reports_with_input() {
+    let input = b"a\x1b[?997;1n\x1b]10;rgb:ffff/ffff/ffff\x07\x1b[?997;2nb";
+    assert_eq!(startup_replay_input(input), b"a\x1b[?997;1n\x1b[?997;2nb");
+    assert_eq!(startup_replay_input(b"a\x1b[?997;"), b"a\x1b[?997;");
+}
+
+#[test]
 fn startup_replay_bounds_oversized_osc_without_exposing_its_payload() {
     let mut input = b"typed\x1b]10;".to_vec();
     input.extend(std::iter::repeat_n(b'x', MAX_REPLAYED_OSC_BYTES));
