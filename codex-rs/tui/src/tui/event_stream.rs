@@ -18,6 +18,7 @@
 //!
 //! See https://ratatui.rs/recipes/apps/spawn-vim/ and https://www.reddit.com/r/rust/comments/1f3o33u/myterious_crossterm_input_after_running_vim for more details.
 
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,6 +26,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Instant;
 
 use crossterm::event::Event;
 use tokio::sync::broadcast;
@@ -44,6 +46,10 @@ pub type EventResult = std::io::Result<Event>;
 /// Value in production is [`CrosstermEventSource`].
 pub trait EventSource: Send + 'static {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>>;
+
+    fn request_default_colors(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Shared crossterm input state for all [`TuiEventStream`] instances. A single crossterm EventStream
@@ -54,6 +60,56 @@ pub struct EventBroker<S: EventSource = CrosstermEventSource> {
     state: Mutex<EventBrokerState<S>>,
     resume_events_tx: watch::Sender<()>,
     pub(super) size_monitor: Option<SizeMonitor>,
+    palette_refresh: Mutex<PaletteRefresh>,
+}
+
+#[derive(Default)]
+struct PaletteRefresh {
+    pending: bool,
+    retry: bool,
+    started_at: Option<Instant>,
+    fg: Option<(u8, u8, u8)>,
+    bg: Option<(u8, u8, u8)>,
+}
+
+impl PaletteRefresh {
+    fn request(&mut self, now: Instant) -> bool {
+        if self.pending
+            && self.started_at.is_some_and(|started| {
+                now.saturating_duration_since(started) < crate::terminal_probe::DEFAULT_TIMEOUT
+            })
+        {
+            self.retry = true;
+            return false;
+        }
+        *self = Self {
+            pending: true,
+            started_at: Some(now),
+            ..Default::default()
+        };
+        true
+    }
+
+    fn receive(
+        &mut self,
+        slot: u8,
+        rgb: (u8, u8, u8),
+    ) -> Option<crate::terminal_probe::DefaultColors> {
+        if !self.pending {
+            return None;
+        }
+        match slot {
+            10 => self.fg = Some(rgb),
+            11 => self.bg = Some(rgb),
+            _ => return None,
+        }
+        let colors = crate::terminal_probe::DefaultColors {
+            fg: self.fg?,
+            bg: self.bg?,
+        };
+        self.pending = false;
+        Some(colors)
+    }
 }
 
 /// Tracks state of underlying [`EventSource`].
@@ -81,12 +137,40 @@ impl<S: EventSource + Default> EventBrokerState<S> {
 }
 
 impl<S: EventSource + Default> EventBroker<S> {
+    fn request_palette(&self) {
+        if !self
+            .palette_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request(Instant::now())
+        {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = state
+            .active_event_source_mut()
+            .map(EventSource::request_default_colors);
+        if !matches!(result, Some(Ok(()))) {
+            self.palette_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending = false;
+            if let Some(Err(error)) = result {
+                tracing::debug!(%error, "terminal palette query failed");
+            }
+        }
+    }
+
     pub fn new() -> Self {
         let (resume_events_tx, _resume_events_rx) = watch::channel(());
         Self {
             state: Mutex::new(EventBrokerState::Start),
             resume_events_tx,
             size_monitor: None,
+            palette_refresh: Mutex::new(PaletteRefresh::default()),
         }
     }
 
@@ -134,6 +218,12 @@ impl Default for CrosstermEventSource {
 }
 
 impl EventSource for CrosstermEventSource {
+    fn request_default_colors(&mut self) -> std::io::Result<()> {
+        let mut output = std::io::stdout();
+        output.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")?;
+        output.flush()
+    }
+
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<EventResult>> {
         // Crossterm's Windows backend expects Win32 input records. If VT input is inherited or
         // restored by another console client, navigation keys arrive as literal escape bytes.
@@ -268,6 +358,24 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
         match event {
             Event::ColorSchemeChanged(scheme) => {
                 tracing::debug!(?scheme, "terminal color scheme changed");
+                self.broker.request_palette();
+                Some(TuiEvent::Draw)
+            }
+            Event::DefaultColor { slot, rgb } => {
+                let (colors, retry) = {
+                    let mut refresh = self
+                        .broker
+                        .palette_refresh
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let colors = refresh.receive(slot, rgb)?;
+                    (colors, std::mem::take(&mut refresh.retry))
+                };
+                if retry {
+                    self.broker.request_palette();
+                    return None;
+                }
+                crate::render::highlight::refresh_terminal_palette(colors);
                 Some(TuiEvent::Draw)
             }
             Event::Key(key_event) => {
@@ -485,6 +593,128 @@ mod tests {
                 other => panic!("expected queued key event, got {other:?}"),
             }
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn palette_refresh_waits_for_both_colors_and_preserves_keys() {
+        use crate::render::highlight;
+        use crate::terminal_palette;
+        use crate::terminal_probe::DefaultColors;
+
+        let light = DefaultColors {
+            fg: (0, 0, 0),
+            bg: (255, 255, 255),
+        };
+        let dark = DefaultColors {
+            fg: (255, 255, 255),
+            bg: (0, 0, 0),
+        };
+        terminal_palette::set_default_colors_from_startup_probe(Some(light));
+        highlight::set_syntax_theme(
+            highlight::resolve_theme_by_name("catppuccin-latte", None).unwrap(),
+        );
+        let light_style = crate::style::user_message_style();
+        let (broker, handle, _draw_tx, draw_rx, focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, focused);
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        for (scheme, colors, first_slot, theme) in [
+            (ColorScheme::Dark, dark, 11, "catppuccin-mocha"),
+            (ColorScheme::Light, light, 10, "catppuccin-latte"),
+        ] {
+            let previous_bg = terminal_palette::default_bg();
+            let revision = highlight::syntax_theme_revision();
+            handle.send(Ok(Event::ColorSchemeChanged(scheme)));
+            assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+            handle.send(Ok(Event::DefaultColor {
+                slot: first_slot,
+                rgb: if first_slot == 10 {
+                    colors.fg
+                } else {
+                    colors.bg
+                },
+            }));
+            handle.send(Ok(Event::Key(key)));
+            assert!(matches!(stream.next().await, Some(TuiEvent::Key(actual)) if actual == key));
+            assert_eq!(terminal_palette::default_bg(), previous_bg);
+            handle.send(Ok(Event::DefaultColor {
+                slot: if first_slot == 10 { 11 } else { 10 },
+                rgb: if first_slot == 10 {
+                    colors.bg
+                } else {
+                    colors.fg
+                },
+            }));
+            assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+            assert_eq!(terminal_palette::default_fg(), Some(colors.fg));
+            assert_eq!(terminal_palette::default_bg(), Some(colors.bg));
+            assert_eq!(
+                highlight::current_syntax_theme(),
+                highlight::resolve_theme_by_name(theme, None).unwrap()
+            );
+            assert!(highlight::syntax_theme_revision() > revision);
+            assert_eq!(
+                crate::style::user_message_style() == light_style,
+                scheme == ColorScheme::Light
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn palette_refresh_requeries_after_overlapping_notifications() {
+        let initial = crate::terminal_probe::DefaultColors {
+            fg: (0, 0, 0),
+            bg: (255, 255, 255),
+        };
+        crate::terminal_palette::set_default_colors_from_startup_probe(Some(initial));
+        let (broker, handle, _draw_tx, draw_rx, focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, focused);
+        handle.send(Ok(Event::ColorSchemeChanged(ColorScheme::Dark)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        handle.send(Ok(Event::DefaultColor {
+            slot: 11,
+            rgb: (32, 32, 32),
+        }));
+        handle.send(Ok(Event::ColorSchemeChanged(ColorScheme::Dark)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        handle.send(Ok(Event::DefaultColor {
+            slot: 10,
+            rgb: (224, 224, 224),
+        }));
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        handle.send(Ok(Event::Key(key)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(actual)) if actual == key));
+        assert_eq!(crate::terminal_palette::default_bg(), Some(initial.bg));
+        handle.send(Ok(Event::DefaultColor {
+            slot: 10,
+            rgb: (255, 255, 255),
+        }));
+        handle.send(Ok(Event::DefaultColor {
+            slot: 11,
+            rgb: (0, 0, 0),
+        }));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        assert_eq!(crate::terminal_palette::default_bg(), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn palette_refresh_ignores_unrequested_colors_and_resets_partial_pairs() {
+        let mut refresh = PaletteRefresh::default();
+        assert!(refresh.receive(10, (1, 2, 3)).is_none());
+        let now = Instant::now();
+        assert!(refresh.request(now));
+        assert!(refresh.receive(11, (4, 5, 6)).is_none());
+        assert!(refresh.request(now + crate::terminal_probe::DEFAULT_TIMEOUT));
+        assert!(refresh.receive(10, (7, 8, 9)).is_none());
+        assert!(refresh.receive(12, (0, 0, 0)).is_none());
+        assert_eq!(
+            refresh.receive(11, (10, 11, 12)),
+            Some(crate::terminal_probe::DefaultColors {
+                fg: (7, 8, 9),
+                bg: (10, 11, 12)
+            })
+        );
+        assert!(refresh.receive(11, (0, 0, 0)).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

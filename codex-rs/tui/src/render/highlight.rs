@@ -251,6 +251,17 @@ fn build_default_theme() -> Theme {
     resolve_theme_with_override(name, codex_home)
 }
 
+pub(crate) fn refresh_terminal_palette(colors: crate::terminal_probe::DefaultColors) {
+    let active = current_syntax_theme();
+    let adaptive = active == build_default_theme();
+    crate::terminal_palette::set_default_colors_from_startup_probe(Some(colors));
+    set_syntax_theme(if adaptive {
+        build_default_theme()
+    } else {
+        active
+    });
+}
+
 fn theme_lock() -> impl std::ops::Deref<Target = RwLock<Theme>> {
     #[cfg(not(test))]
     {

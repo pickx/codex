@@ -139,6 +139,13 @@ pub fn default_bg() -> Option<(u8, u8, u8)> {
 pub(crate) fn set_default_colors_from_startup_probe(
     colors: Option<crate::terminal_probe::DefaultColors>,
 ) {
+    #[cfg(test)]
+    TEST_DEFAULT_COLORS.with(|cache| {
+        cache.set(colors.map(|colors| DefaultColors {
+            fg: colors.fg,
+            bg: colors.bg,
+        }))
+    });
     imp::set_default_colors_from_startup_probe(colors);
 }
 
